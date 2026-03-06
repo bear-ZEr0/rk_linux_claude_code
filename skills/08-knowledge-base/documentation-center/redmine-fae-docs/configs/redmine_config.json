@@ -1,0 +1,10 @@
+{
+  "api_key": "4775784625f5a521e873fbbc4bf901561d82f02e",
+  "base_url": "https://10.10.10.70",
+  "fae_project_url": "https://10.10.10.70/projects/fae/documents",
+  "cache_dir": "/tmp/fae_docs_cache",
+  "cache_ttl": 86400,
+  "session_file": "/tmp/redmine_session.pkl",
+  "username": "ai-assistant",
+  "password": "ai-assistant"
+}
