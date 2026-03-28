@@ -3,13 +3,14 @@
 """
 Gerrit API 统一客户端
 
-合并 collect-weekly-data.py 和 gerrit_review.py 的 Gerrit 访问逻辑，
+优先使用 SSH 方式访问 Gerrit（gerrit query），REST API 作为备用。
 提供认证、查询、操作、统计等通用接口。
 """
 
 import base64
 import json
 import ssl
+import subprocess
 import sys
 import urllib.error
 import urllib.parse
@@ -22,6 +23,78 @@ SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.check_hostname = False
 SSL_CONTEXT.verify_mode = ssl.CERT_NONE
 
+# ---------------------------------------------------------------------------
+# SSH 方式（优先）
+# ---------------------------------------------------------------------------
+
+def _ssh_host(url):
+    """从 Gerrit URL 提取主机地址"""
+    return url.rstrip("/").replace("https://", "").replace("http://", "")
+
+
+def _ssh_cmd(host, port, user, query_args):
+    """构造 gerrit query SSH 命令
+
+    不指定 -i，让 SSH 自动从 ~/.ssh/ 和 ssh-agent 中选择可用 key。
+    """
+    cmd = [
+        "ssh",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ConnectTimeout=10",
+        "-o", "IdentitiesOnly=yes",
+        "-p", str(port),
+    ]
+    cmd += [f"{user}@{host}", "gerrit", "query", "--format=JSON"] + query_args
+    return cmd
+
+
+def _ssh_query(query_args, url=None, username=None, port=29418):
+    """通过 SSH 执行 gerrit query，返回解析后的 JSON 对象列表"""
+    if url is None:
+        settings = load_settings()
+        url = settings["url"]
+        username = settings["username"]
+
+    host = _ssh_host(url)
+    cmd = _ssh_cmd(host, port, username, query_args)
+
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            if stderr:
+                print(f"警告: SSH gerrit query 返回非零: {stderr}", file=sys.stderr)
+            return []
+        lines = [l for l in result.stdout.strip().splitlines() if l]
+        # gerrit query 最后一行是 {"type":"stats",...}，过滤掉
+        objects = []
+        for line in lines:
+            try:
+                obj = json.loads(line)
+                if obj.get("type") == "stats":
+                    continue
+                objects.append(obj)
+            except json.JSONDecodeError:
+                pass
+        return objects
+    except subprocess.TimeoutExpired:
+        print("错误: SSH gerrit query 超时", file=sys.stderr)
+        return []
+    except FileNotFoundError:
+        print("错误: 未找到 ssh 命令，请确认 OpenSSH 已安装", file=sys.stderr)
+        return []
+
+
+def _ssh_query_single(query_args, url=None, username=None, port=29418):
+    """返回单个对象（用于 change 查询）"""
+    results = _ssh_query(query_args, url, username, port)
+    return results[0] if results else None
+
 
 def load_settings():
     """从项目根 settings.json 读取 gerrit 配置"""
@@ -32,8 +105,8 @@ def load_settings():
             with open(settings_file, "r", encoding="utf-8") as f:
                 config = json.load(f)
             gerrit = config.get("gerrit", {})
-            if not gerrit.get("url") or not gerrit.get("username") or not gerrit.get("password"):
-                print("错误: settings.json 中 gerrit.url / username / password 配置不完整", file=sys.stderr)
+            if not gerrit.get("url") or not gerrit.get("username"):
+                print("错误: settings.json 中 gerrit.url / username 配置不完整", file=sys.stderr)
                 sys.exit(1)
             return gerrit
         current = current.parent
@@ -136,155 +209,136 @@ def api_post(opener, headers, base_url, path, data, xsrf_token=None):
 # 查询接口
 # ---------------------------------------------------------------------------
 
-def get_changes(url, username, password, since, until, query_extra=""):
-    """按时间段查询提交列表，返回 List[Dict]
+def get_changes(since, until, url=None, username=None, password=None, query_extra=""):
+    """按时间段查询提交列表，返回 List[Dict]（SSH 方式）
 
     默认查询 owner:self，可通过 query_extra 追加条件。
     """
-    if not url or not username:
-        return []
+    settings = load_settings()
+    if url is None:
+        url = settings["url"]
+        username = settings["username"]
+        password = settings.get("password")  # REST 备用，不一定存在
 
-    headers = _make_auth_header(username, password)
-    cookie_handler = urllib.request.HTTPCookieProcessor()
-    opener = urllib.request.build_opener(
-        cookie_handler,
-        urllib.request.HTTPSHandler(context=SSL_CONTEXT)
-    )
+    query = f"owner:self+after:{since}+before:{until}"
+    if query_extra:
+        query += f"+{urllib.parse.quote(query_extra, safe=':')}"
 
+    results = _ssh_query([query], url, username)
     changes = []
-    try:
-        login_url = f"{url.rstrip('/')}/login/"
-        login_req = urllib.request.Request(login_url, headers=headers)
-        opener.open(login_req, timeout=30)
-
-        query = f"owner:self+after:{since}+before:{until}"
-        if query_extra:
-            query += f"+{urllib.parse.quote(query_extra, safe=':')}"
-        api_url = f"{url.rstrip('/')}/changes/?q={query}"
-
-        req = urllib.request.Request(api_url, headers=headers)
-        with opener.open(req, timeout=60) as response:
-            content = response.read().decode("utf-8")
-            if content.startswith(")]}'"):
-                content = content[4:]
-            data = json.loads(content)
-
-            for change in data:
-                changes.append({
-                    "id": change.get("change_id"),
-                    "number": change.get("_number"),
-                    "subject": change.get("subject"),
-                    "project": change.get("project"),
-                    "branch": change.get("branch"),
-                    "status": change.get("status"),
-                    "updated": change.get("updated"),
-                    "insertions": change.get("insertions", 0),
-                    "deletions": change.get("deletions", 0),
-                })
-    except urllib.error.URLError as e:
-        print(f"获取 Gerrit 数据失败: {e}", file=sys.stderr)
-    except json.JSONDecodeError as e:
-        print(f"解析 Gerrit 响应失败: {e}", file=sys.stderr)
-
+    for change in results:
+        changes.append({
+            "id": change.get("id"),
+            "number": change.get("number"),
+            "subject": change.get("subject"),
+            "project": change.get("project"),
+            "branch": change.get("branch"),
+            "status": change.get("status"),
+            "updated": change.get("lastUpdated"),
+            "insertions": change.get("insertions", 0),
+            "deletions": change.get("deletions", 0),
+        })
     return changes
 
 
 def get_change_detail(change_number, url=None, username=None, password=None):
     """查询 Change 详情（状态、审核人、评论）"""
+    settings = load_settings()
     if url is None:
-        settings = load_settings()
-        url, username, password = settings["url"], settings["username"], settings["password"]
-    opener, headers, _ = login(url, username, password)
-    query = urllib.parse.quote(str(change_number), safe="")
-    changes = api_get(
-        opener, headers, url,
-        f"/changes/?q=change:{query}&o=CURRENT_REVISION&o=DETAILED_ACCOUNTS&o=DETAILED_LABELS"
-    )
-    if not changes:
-        return {}
-    return changes[0]
+        url = settings["url"]
+        username = settings["username"]
+    return _ssh_query_single([f"change:{change_number}", "--current-patch-set"], url, username) or {}
 
 
 def get_change_diff(change_id, url=None, username=None, password=None):
-    """获取 Change 最新 patchset 的 diff，返回 (meta_dict, diff_str)"""
-    if url is None:
-        settings = load_settings()
-        url, username, password = settings["url"], settings["username"], settings["password"]
-    opener, headers, _ = login(url, username, password)
+    """获取 Change 最新 patchset 的 diff，返回 (meta_dict, diff_str)
 
-    query = urllib.parse.quote(str(change_id), safe="")
-    changes = api_get(
-        opener, headers, url,
-        f"/changes/?q=change:{query}&o=CURRENT_REVISION&o=DETAILED_ACCOUNTS"
+    使用 SSH 获取 meta 信息，REST 获取 diff 内容。
+    """
+    settings = load_settings()
+    if url is None:
+        url = settings["url"]
+        username = settings["username"]
+        password = settings.get("password")
+
+    # SSH 获取 patch set 元信息
+    change_data = _ssh_query_single(
+        [f"change:{change_id}", "--current-patch-set"],
+        url, username
     )
-    if not changes:
+    if not change_data:
         return None, ""
 
-    change = changes[0]
-    number = change.get("_number")
-    current_rev = change.get("current_revision", "")
-    revisions = change.get("revisions", {})
-    patch_set_num = revisions.get(current_rev, {}).get("_number", "?")
-
-    patch_url = f"{url.rstrip('/')}/changes/{number}/revisions/current/patch"
-    req = urllib.request.Request(patch_url, headers=headers)
-    with opener.open(req, timeout=60) as response:
-        patch_b64 = response.read().decode("utf-8")
-        diff_content = base64.b64decode(patch_b64).decode("utf-8", errors="replace")
+    ps = change_data.get("currentPatchSet", {})
+    patch_set_num = ps.get("number", "?")
+    revision = ps.get("revision", "")
 
     meta = {
-        "number": number,
+        "number": change_data.get("number"),
         "patch_set": patch_set_num,
-        "subject": change.get("subject", ""),
-        "project": change.get("project", ""),
-        "branch": change.get("branch", ""),
-        "owner": change.get("owner", {}).get("name", ""),
-        "revision": current_rev[:12] if current_rev else "",
+        "subject": change_data.get("subject", ""),
+        "project": change_data.get("project", ""),
+        "branch": change_data.get("branch", ""),
+        "owner": change_data.get("owner", {}).get("name", ""),
+        "revision": revision[:12] if revision else "",
     }
-    return meta, diff_content
+
+    # diff 内容通过 REST 获取（SSH 不直接支持）
+    if not password:
+        return meta, "(diff 需要 HTTP 密码，请在 settings.json 中配置 gerrit.password)"
+
+    try:
+        opener, headers, _ = login(url, username, password)
+        patch_url = f"{url.rstrip('/')}/changes/{change_id}/revisions/current/patch"
+        req = urllib.request.Request(patch_url, headers=headers)
+        with opener.open(req, timeout=60) as response:
+            patch_b64 = response.read().decode("utf-8")
+            diff_content = base64.b64decode(patch_b64).decode("utf-8", errors="replace")
+        return meta, diff_content
+    except Exception as e:
+        return meta, f"(获取 diff 失败: {e})"
 
 
 def get_reviewer_changes(since, until, url=None, username=None, password=None):
     """获取待自己 review 的 Change 列表"""
+    settings = load_settings()
     if url is None:
-        settings = load_settings()
-        url, username, password = settings["url"], settings["username"], settings["password"]
-    opener, headers, _ = login(url, username, password)
+        url = settings["url"]
+        username = settings["username"]
     query = f"reviewer:self+status:open+after:{since}+before:{until}"
-    api_url = f"{url.rstrip('/')}/changes/?q={query}"
-    req = urllib.request.Request(api_url, headers=headers)
-    try:
-        with opener.open(req, timeout=60) as response:
-            content = response.read().decode("utf-8")
-            if content.startswith(")]}'"):
-                content = content[4:]
-            return json.loads(content)
-    except (urllib.error.URLError, json.JSONDecodeError) as e:
-        print(f"获取待 review 列表失败: {e}", file=sys.stderr)
-        return []
+    return _ssh_query([query], url, username)
 
 
 def get_project_changes(project, branch=None, limit=20,
                         url=None, username=None, password=None):
     """查询项目提交历史"""
+    settings = load_settings()
     if url is None:
-        settings = load_settings()
-        url, username, password = settings["url"], settings["username"], settings["password"]
-    opener, headers, _ = login(url, username, password)
+        url = settings["url"]
+        username = settings["username"]
     query = f"project:{project}"
     if branch:
         query += f"+branch:{branch}"
-    api_url = f"{url.rstrip('/')}/changes/?q={query}&n={limit}"
-    req = urllib.request.Request(api_url, headers=headers)
-    try:
-        with opener.open(req, timeout=60) as response:
-            content = response.read().decode("utf-8")
-            if content.startswith(")]}'"):
-                content = content[4:]
-            return json.loads(content)
-    except (urllib.error.URLError, json.JSONDecodeError) as e:
-        print(f"获取项目提交历史失败: {e}", file=sys.stderr)
+    return _ssh_query([query, f"--limit={limit}"], url, username)
+
+
+def get_change_messages(change_id, url=None, username=None, password=None):
+    """获取 Change 所有评论/Messages（SSH 方式）
+
+    返回 List[Dict]，每条包含 timestamp, reviewer, message。
+    """
+    settings = load_settings()
+    if url is None:
+        url = settings["url"]
+        username = settings["username"]
+
+    results = _ssh_query(
+        [f"change:{change_id}", "--comments", "--patch-sets"],
+        url, username
+    )
+    if not results:
         return []
+    return results[0].get("comments", [])
 
 
 # ---------------------------------------------------------------------------
@@ -292,19 +346,11 @@ def get_project_changes(project, branch=None, limit=20,
 # ---------------------------------------------------------------------------
 
 def submit_review(change_id, score, message, url=None, username=None, password=None):
-    """提交 Code-Review 评分，返回 bool"""
+    """提交 Code-Review 评分，返回 bool（SSH 方式）"""
+    settings = load_settings()
     if url is None:
-        settings = load_settings()
-        url, username, password = settings["url"], settings["username"], settings["password"]
-    opener, headers, xsrf_token = login(url, username, password)
-
-    query = urllib.parse.quote(str(change_id), safe="")
-    changes = api_get(opener, headers, url, f"/changes/?q=change:{query}")
-    if not changes:
-        print(f"错误: 未找到 Change {change_id}", file=sys.stderr)
-        return False
-
-    number = changes[0].get("_number")
+        url = settings["url"]
+        username = settings["username"]
 
     VALID_SCORES = {-2, -1, 0, 1, 2}
     try:
@@ -316,16 +362,35 @@ def submit_review(change_id, score, message, url=None, username=None, password=N
         print(f"错误: 打分值 {score_int} 超出范围，有效值: -2, -1, 0, +1, +2", file=sys.stderr)
         return False
 
-    review_data = {
-        "message": message,
-        "labels": {"Code-Review": score_int}
-    }
+    # 先通过 SSH 获取 change 编号（gerrit review 用数字编号）
+    change_data = _ssh_query_single([f"change:{change_id}"], url, username)
+    if not change_data:
+        print(f"错误: 未找到 Change {change_id}", file=sys.stderr)
+        return False
 
-    api_post(
-        opener, headers, url,
-        f"/changes/{number}/revisions/current/review",
-        review_data, xsrf_token
-    )
+    number = change_data.get("number")
+    rev = change_data.get("currentPatchSet", {}).get("revision", "")
+
+    host = _ssh_host(url)
+    cmd = _ssh_cmd(host, 29418, username, [
+        "review",
+        "--code-review", str(score_int),
+    ])
+    if message:
+        cmd += ["--message", message]
+    if rev:
+        cmd += [f"--project={change_data.get('project')}", rev]
+    else:
+        cmd += [str(number)]
+
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            print(f"错误: gerrit review 失败: {result.stderr.strip()}", file=sys.stderr)
+            return False
+    except subprocess.TimeoutExpired:
+        print("错误: gerrit review 超时", file=sys.stderr)
+        return False
 
     score_str = f"+{score_int}" if score_int > 0 else str(score_int)
     print(f"已提交审核: Change {number}, Code-Review {score_str}")
@@ -351,8 +416,5 @@ def get_stats(changes):
 
 def get_stats_report(since, until, url=None, username=None, password=None):
     """提交统计报表（提交数、合并数、代码行数）"""
-    if url is None:
-        settings = load_settings()
-        url, username, password = settings["url"], settings["username"], settings["password"]
-    changes = get_changes(url, username, password, since, until)
+    changes = get_changes(since, until, url, username, password)
     return get_stats(changes)
